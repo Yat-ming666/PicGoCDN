@@ -1,0 +1,333 @@
+<#
+#### .ps1####
+.SYNOPSIS
+Windows 服务器角色一键部署脚本
+
+.DESCRIPTION
+此脚本提供以下功能：
+1. 设置静态IP地址
+2. 安装Active Directory域服务（包含DNS）
+3. 安装DHCP服务器
+4. 安装FTP服务器
+5. 支持自定义选择安装的服务
+6. 安全的密码输入机制
+
+.NOTES
+作者: AI助手
+版本: 2.0
+日期: 2023-10-15
+#>
+
+# 检查管理员权限
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "`n错误：请使用管理员权限运行此脚本" -ForegroundColor Red
+    Write-Host "右键点击脚本文件，选择'使用PowerShell运行'" -ForegroundColor Yellow
+    exit 1
+}
+
+# 主菜单函数
+function Show-MainMenu {
+    Clear-Host
+    Write-Host "`n`t===== Windows 服务器角色部署工具 =====" -ForegroundColor Cyan
+    Write-Host "`n服务器名称: $env:COMPUTERNAME"
+    Write-Host "当前IP: $((Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.InterfaceAlias -notlike "*Loopback*"}).IPAddress)"
+    
+    Write-Host "`n请选择要执行的操作:" -ForegroundColor Yellow
+    Write-Host "1. 设置静态IP地址" -ForegroundColor Green
+    Write-Host "2. 安装服务器角色" -ForegroundColor Green
+    Write-Host "3. 查看已安装角色" -ForegroundColor Blue
+    Write-Host "4. 退出脚本" -ForegroundColor Red
+    Write-Host "`n========================================" -ForegroundColor Cyan
+}
+
+# 设置静态IP
+function Set-StaticIP {
+    $adapter = Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | Select-Object -First 1
+    
+    if (-not $adapter) {
+        Write-Host "`n未找到活动的网络适配器!" -ForegroundColor Red
+        return
+    }
+
+    Write-Host "`n正在配置网络适配器: $($adapter.Name)" -ForegroundColor Cyan
+    
+    # 获取当前网络信息
+    $currentIP = (Get-NetIPAddress -InterfaceAlias $adapter.Name -AddressFamily IPv4).IPAddress
+    $currentGateway = (Get-NetRoute -InterfaceAlias $adapter.Name -AddressFamily IPv4 | Where-Object {$_.DestinationPrefix -eq '0.0.0.0/0'}).NextHop
+    $currentDNS = (Get-DnsClientServerAddress -InterfaceAlias $adapter.Name -AddressFamily IPv4).ServerAddresses
+
+    # 用户输入
+    Write-Host "`n当前IP: $currentIP" -ForegroundColor Yellow
+    $ipAddress = Read-Host "请输入静态IP地址 (例如: 192.168.1.10) [$currentIP]"
+    if ([string]::IsNullOrWhiteSpace($ipAddress)) { $ipAddress = $currentIP }
+    
+    $subnetMask = Read-Host "请输入子网掩码 (例如: 255.255.255.0) [255.255.255.0]"
+    if ([string]::IsNullOrWhiteSpace($subnetMask)) { $subnetMask = "255.255.255.0" }
+    
+    Write-Host "`n当前网关: $currentGateway" -ForegroundColor Yellow
+    $gateway = Read-Host "请输入默认网关 [$currentGateway]"
+    if ([string]::IsNullOrWhiteSpace($gateway)) { $gateway = $currentGateway }
+    
+    Write-Host "`n当前DNS: $($currentDNS -join ', ')" -ForegroundColor Yellow
+    $dnsServers = Read-Host "请输入DNS服务器 (多个用逗号分隔) [$($currentDNS -join ', ')]"
+    if ([string]::IsNullOrWhiteSpace($dnsServers)) { 
+        $dnsServers = $currentDNS -join ','
+    } else {
+        $dnsServers = $dnsServers -replace '\s+', ''  # 移除空格
+    }
+
+    # 配置IP
+    try {
+        # 移除现有配置
+        Remove-NetIPAddress -InterfaceAlias $adapter.Name -Confirm:$false -ErrorAction SilentlyContinue
+        Remove-NetRoute -InterfaceAlias $adapter.Name -Confirm:$false -ErrorAction SilentlyContinue
+
+        # 设置新IP
+        New-NetIPAddress -IPAddress $ipAddress `
+                         -PrefixLength $subnetMask `
+                         -DefaultGateway $gateway `
+                         -InterfaceAlias $adapter.Name | Out-Null
+        
+        # 设置DNS
+        Set-DnsClientServerAddress -InterfaceAlias $adapter.Name `
+                                   -ServerAddresses ($dnsServers -split ',') | Out-Null
+        
+        Write-Host "`n静态IP配置成功!" -ForegroundColor Green
+        Write-Host "新IP地址: $ipAddress"
+        Write-Host "子网掩码: $subnetMask"
+        Write-Host "网关: $gateway"
+        Write-Host "DNS: $dnsServers"
+    }
+    catch {
+        Write-Host "`n配置失败: $_" -ForegroundColor Red
+    }
+    
+    Read-Host "`n按Enter键继续..."
+}
+
+# 安装服务器角色
+function Install-ServerRoles {
+    Clear-Host
+    Write-Host "`n`t===== 服务器角色安装 =====" -ForegroundColor Cyan
+    Write-Host "`n请选择要安装的角色 (可多选，用逗号分隔):`n" -ForegroundColor Yellow
+    
+    $roles = @(
+        "Active Directory 域服务 (包含DNS)",
+        "DHCP 服务器",
+        "FTP 服务器"
+    )
+    
+    # 显示角色选项
+    for ($i = 0; $i -lt $roles.Count; $i++) {
+        Write-Host "$($i+1). $($roles[$i])"
+    }
+    
+    $selected = Read-Host "`n输入选择 (例如: 1,3) "
+    $choices = $selected -split ',' | ForEach-Object { [int]$_ - 1 } | Where-Object { $_ -ge 0 -and $_ -lt $roles.Count }
+    
+    if (-not $choices) {
+        Write-Host "`n未选择任何角色!" -ForegroundColor Red
+        Read-Host "按Enter键返回..."
+        return
+    }
+    
+    # 安装选中的角色
+    foreach ($choice in $choices) {
+        switch ($choice) {
+            0 { Install-ADDS }
+            1 { Install-DHCPServer }
+            2 { Install-FTPServer }
+        }
+    }
+}
+
+# 安装AD域服务
+function Install-ADDS {
+    # 检查是否已安装
+    if ((Get-WindowsFeature -Name AD-Domain-Services).Installed) {
+        Write-Host "`nAD域服务已安装!" -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "`n===== 正在安装Active Directory域服务 =====" -ForegroundColor Cyan
+    
+    # 获取域名
+    $domainName = Read-Host "`n请输入域名 (例如: mycompany.local)"
+    if ([string]::IsNullOrWhiteSpace($domainName)) {
+        Write-Host "域名不能为空!" -ForegroundColor Red
+        return
+    }
+
+    # 目录还原模式密码
+    $safeModePassword = $null
+    while ($true) {
+        $pass1 = Read-Host "`n请设置目录服务还原模式(DSRM)密码" -AsSecureString
+        $pass2 = Read-Host "请确认DSRM密码" -AsSecureString
+        
+        # 比较密码
+        $bstr1 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($pass1)
+        $bstr2 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($pass2)
+        $plainPass1 = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr1)
+        $plainPass2 = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr2)
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr1)
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr2)
+        
+        if ($plainPass1 -eq $plainPass2) {
+            $safeModePassword = $pass1
+            break
+        }
+        
+        Write-Host "`n密码不匹配，请重新输入!" -ForegroundColor Red
+    }
+
+    # 安装域服务
+    try {
+        Write-Host "`n正在安装AD域服务和DNS..." -ForegroundColor Yellow
+        Install-WindowsFeature -Name AD-Domain-Services, DNS -IncludeManagementTools | Out-Null
+        
+        # 导入AD模块
+        Import-Module ADDSDeployment
+        
+        # 配置新林
+        $installParams = @{
+            DomainName                    = $domainName
+            SafeModeAdministratorPassword = $safeModePassword
+            InstallDns                    = $true
+            Force                         = $true
+            Confirm                       = $false
+            NoRebootOnCompletion          = $false
+        }
+        
+        Write-Host "`n正在配置域控制器..." -ForegroundColor Yellow
+        Install-ADDSForest @installParams | Out-Null
+        
+        Write-Host "`nAD域服务安装成功! 服务器将自动重启..." -ForegroundColor Green
+        Start-Sleep -Seconds 5
+        Restart-Computer -Force
+    }
+    catch {
+        Write-Host "`n安装失败: $_" -ForegroundColor Red
+        Read-Host "按Enter键继续..."
+    }
+}
+
+# 安装DHCP服务器
+function Install-DHCPServer {
+    # 检查是否已安装
+    if ((Get-WindowsFeature -Name DHCP).Installed) {
+        Write-Host "`nDHCP服务器已安装!" -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "`n===== 正在安装DHCP服务器 =====" -ForegroundColor Cyan
+    
+    # 安装DHCP
+    try {
+        Write-Host "`n正在安装DHCP服务..." -ForegroundColor Yellow
+        Install-WindowsFeature -Name DHCP -IncludeManagementTools | Out-Null
+        
+        # 添加DHCP安全组
+        Add-DhcpServerSecurityGroup -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\ServerManager\Roles\12 -Name ConfigurationState -Value 2
+        
+        # 授权DHCP服务器
+        Add-DhcpServerInDC -DnsName $env:COMPUTERNAME
+        
+        Write-Host "`nDHCP服务器安装成功!" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "`n安装失败: $_" -ForegroundColor Red
+    }
+    
+    Read-Host "`n按Enter键继续..."
+}
+
+# 安装FTP服务器
+function Install-FTPServer {
+    # 检查是否已安装
+    if ((Get-WindowsFeature -Name Web-Ftp-Server).Installed) {
+        Write-Host "`nFTP服务器已安装!" -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "`n===== 正在安装FTP服务器 =====" -ForegroundColor Cyan
+    
+    try {
+        Write-Host "`n正在安装IIS和FTP服务..." -ForegroundColor Yellow
+        Install-WindowsFeature -Name Web-Server, Web-Ftp-Server -IncludeManagementTools | Out-Null
+        
+        Write-Host "`nFTP服务器安装成功!" -ForegroundColor Green
+        Write-Host "请使用IIS管理器配置FTP站点" -ForegroundColor Yellow
+    }
+    catch {
+        Write-Host "`n安装失败: $_" -ForegroundColor Red
+    }
+    
+    Read-Host "`n按Enter键继续..."
+}
+
+# 查看已安装角色
+function Show-InstalledRoles {
+    Clear-Host
+    Write-Host "`n`t===== 已安装的服务器角色 =====" -ForegroundColor Cyan
+    
+    # AD域服务
+    $adInstalled = (Get-WindowsFeature -Name AD-Domain-Services).Installed
+    Write-Host "`nActive Directory 域服务: " -NoNewline
+    if ($adInstalled) {
+        Write-Host "已安装" -ForegroundColor Green
+        try {
+            $domain = (Get-WmiObject Win32_ComputerSystem).Domain
+            Write-Host "域名: $domain"
+        } catch {}
+    } else {
+        Write-Host "未安装" -ForegroundColor Red
+    }
+    
+    # DNS服务器
+    $dnsInstalled = (Get-WindowsFeature -Name DNS).Installed
+    Write-Host "`nDNS 服务器: " -NoNewline
+    if ($dnsInstalled) {
+        Write-Host "已安装" -ForegroundColor Green
+    } else {
+        Write-Host "未安装" -ForegroundColor Red
+    }
+    
+    # DHCP服务器
+    $dhcpInstalled = (Get-WindowsFeature -Name DHCP).Installed
+    Write-Host "`nDHCP 服务器: " -NoNewline
+    if ($dhcpInstalled) {
+        Write-Host "已安装" -ForegroundColor Green
+    } else {
+        Write-Host "未安装" -ForegroundColor Red
+    }
+    
+    # FTP服务器
+    $ftpInstalled = (Get-WindowsFeature -Name Web-Ftp-Server).Installed
+    Write-Host "`nFTP 服务器: " -NoNewline
+    if ($ftpInstalled) {
+        Write-Host "已安装" -ForegroundColor Green
+    } else {
+        Write-Host "未安装" -ForegroundColor Red
+    }
+    
+    Write-Host "`n=================================" -ForegroundColor Cyan
+    Read-Host "`n按Enter键返回主菜单..."
+}
+
+# 主循环
+while ($true) {
+    Show-MainMenu
+    $choice = Read-Host "`n请选择操作 (1-4)"
+    
+    switch ($choice) {
+        "1" { Set-StaticIP }
+        "2" { Install-ServerRoles }
+        "3" { Show-InstalledRoles }
+        "4" { exit }
+        default {
+            Write-Host "无效选择，请重新输入!" -ForegroundColor Red
+            Start-Sleep -Seconds 2
+        }
+    }
+}
